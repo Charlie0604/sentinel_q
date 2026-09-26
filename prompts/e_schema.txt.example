@@ -1,0 +1,9 @@
+只输出以下 JSON 格式，不要输出任何额外说明文字：
+{
+  "is_relevant": true/false,
+  "platform_stance": "有利/抹黑/中立/不相关",
+  "stance_confidence": 0.0-1.0,
+  "risk_level": "低风险/中风险/高风险",
+  "risk_reasoning": "简短说明判断依据",
+  "ai_summary": "一句话摘要"
+}
