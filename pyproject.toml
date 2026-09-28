@@ -9,17 +9,21 @@ description = "知乎舆情监控与取证系统"
 requires-python = ">=3.11"
 dependencies = [
     "playwright>=1.40",
-    "httpx>=0.27",
+    # 解析层用：把「浏览器抓到的 HTML 片段」变成结构。见 sentinel_q/collector/parse.py
+    # 为什么不直接在浏览器里用 JS 抽取：那样解析逻辑就没法对着真实页面快照
+    # 跑单元测试了，而解析恰恰是最容易写错、又最需要固件保护的部分。
+    "beautifulsoup4>=4.12",
 ]
 
 [project.optional-dependencies]
-db = ["supabase>=2.0"]
+# 走 psycopg 直连 Postgres，不是 supabase-py / PostgREST——理由见 sentinel_q/storage/supabase.py 开头
+db = ["psycopg[binary]>=3.1"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["core", "modules"]
+packages = ["src/sentinel_q"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "core", "modules"]
+testpaths = ["tests", "src"]
 markers = ["integration: 需要真实数据库或外部网络，默认不跑"]
 addopts = "-m 'not integration' --strict-markers"

@@ -1,18 +1,19 @@
-"""仓储接口的契约测试（架构文档 8.5）。
+"""仓储接口的契约测试（架构文档 7.5）。
 
 这些用例跑在 `FakeRepo` 上，不碰网络、不连数据库。它们要钉住的不是
-"FakeRepo 好用"，而是**三条并发下的正确性规则**——每条都对应架构文档里
-一个已经踩过的坑，而且都容易在实现时写错：
+"FakeRepo 好用"，而是**几条容易在实现时写错的规则**——每条都对应架构文档里
+一个已经踩过的坑：
 
   1. `claim_question` 必须原子抢占（4.1：两个线程不能问同一个问题两遍）
   2. `mark_follow_up_done` 必须条件更新（4.2：否则整个问题的回答会被爬两遍）
   3. `insert_content` 必须靠 url 唯一约束静默挡重复（3.9：不能报错中断任务）
+  4. `ensure_author` 必须是 upsert（作者维度：同一个人只能有一行 `dim_author`）
 """
 
 from __future__ import annotations
 
-from core.models import AnalysisResult, ContentRecord
-from core.repo import FakeRepo
+from sentinel_q.shared.models import AnalysisResult, ContentRecord
+from sentinel_q.storage import FakeRepo
 
 
 def _record(url: str, zhihu_id: str = "456") -> ContentRecord:
@@ -71,29 +72,36 @@ def test_existing_urls_batch_lookup() -> None:
     assert known == {"https://www.zhihu.com/question/1/answer/2"}
 
 
-def test_queue_claim_hands_each_url_to_one_worker() -> None:
-    """8.8：两个采集进程并行抢任务，同一条 URL 不能被抢走两次。"""
+def test_ensure_author_is_an_upsert_not_an_insert() -> None:
+    """⭐ 同一个人返回**同一个** `author_id`，昵称取最新值。
+
+    写成普通 insert 的话，同一个人在这批里的第二条内容就会撞唯一约束——
+    要么抛异常中断整批，要么 `do nothing` 之后拿不到 ID、`author_id` 又变 null。
+    """
     repo = FakeRepo()
-    repo.enqueue("https://www.zhihu.com/question/1/answer/2", priority=5)
-    repo.enqueue("https://www.zhihu.com/question/1/answer/3")
 
-    first = repo.claim_next_url("worker-a")
-    second = repo.claim_next_url("worker-b")
-    third = repo.claim_next_url("worker-c")
+    first = repo.ensure_author("gqd2kn", "旧昵称", "https://www.zhihu.com/people/gqd2kn")
+    second = repo.ensure_author("gqd2kn", "新昵称", "https://www.zhihu.com/people/gqd2kn")
 
-    assert first is not None and first.url.endswith("/answer/2")
-    assert second is not None and second.url.endswith("/answer/3")
-    assert third is None  # 队列空了
+    assert first == second
+    assert len(repo.authors) == 1
+    assert repo.authors["gqd2kn"][0] == "新昵称", "昵称会改，每次覆盖"
+
+
+def test_ensure_author_keeps_different_people_apart() -> None:
+    repo = FakeRepo()
+    assert repo.ensure_author("a", None, None) != repo.ensure_author("b", None, None)
 
 
 def test_analysis_records_prompt_version() -> None:
     """8.9：提示词不进 git，所以 prompt_version 是唯一能追溯"当时用的哪版"的地方。"""
     repo = FakeRepo()
-    repo.insert_content(_record("https://www.zhihu.com/question/1/answer/2"))
+    content_id = repo.insert_content(_record("https://www.zhihu.com/question/1/answer/2"))
+    assert content_id is not None
 
     repo.save_analysis(
         AnalysisResult(
-            content_id="c1",
+            content_id=content_id,
             platform_stance="抹黑",
             risk_level="中风险",
             model_version="claude-sonnet-5",
@@ -101,4 +109,4 @@ def test_analysis_records_prompt_version() -> None:
         )
     )
 
-    assert repo.analyses["c1"].prompt_version == "a1b2c3d4e5f60718"
+    assert repo.analyses[content_id].prompt_version == "a1b2c3d4e5f60718"

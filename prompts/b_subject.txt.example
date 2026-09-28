@@ -1,6 +1,6 @@
 ⚠️ 这是模板，不是真实提示词。
 真实内容含监测对象的具体信息，不入 git——它在线上库的 dim_prompt 表里。
-用 `python -m modules.m2_analyst prompts pull` 拉到本地工作区。
+用 `python -m sentinel_q.storage prompts pull` 拉到本地工作区。
 
 监测对象：{具体团体/平台名称}
 监测对象的基本情况：{一两句话说明这是什么团体、做什么的，方便 AI 理解"有利/抹黑"的判断基准}
