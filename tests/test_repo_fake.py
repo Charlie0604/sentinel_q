@@ -42,8 +42,37 @@ def test_question_relevance_starts_unknown() -> None:
 def test_follow_up_only_fires_once() -> None:
     """4.2 的条件更新：并发下只应有一个线程触发全量回答采集。"""
     repo = FakeRepo()
-    assert repo.mark_follow_up_done(7) is True
+    question_id = repo.claim_question("123", None, None)
+    assert question_id is not None
+
+    assert repo.mark_follow_up_done(question_id) is True
+    assert repo.mark_follow_up_done(question_id) is False
+
+
+def test_follow_up_on_missing_question_returns_false() -> None:
+    """不存在的 question_id：SQL 里是 `update ... where id = $1` 命中 0 行。
+
+    0 行受影响**不报错**，返回 False 而不是抛异常。⚠️ 这里返回 True 是危险的：
+    `True` 的语义是"这次由我触发了该问题下的全量回答采集"（决策 40），
+    凭空返回 True 会让调用方以为问题存在且没被采过。
+    """
+    repo = FakeRepo()
     assert repo.mark_follow_up_done(7) is False
+
+
+def test_updates_on_missing_rows_are_silent() -> None:
+    """update 不命中任何行 = 静默无事发生，与 Postgres 一致。
+
+    要给人话的错误提示（"这条内容不存在"）由组合函数先查一次再写，
+    那是 review / evidence 那一层的活。
+    """
+    repo = FakeRepo()
+    repo.set_question_relevance(7, True)
+    repo.mark_answers_collected(7)
+    repo.refresh_content_metrics("no-such-id", voteup_count=1, comment_count=2)
+    repo.mark_content_status("no-such-id", "deleted_detected")
+    repo.set_author_watch("no-such-author", is_watched=True)
+    assert repo.all_questions() == []
 
 
 def test_duplicate_url_is_swallowed_not_raised() -> None:
@@ -110,3 +139,48 @@ def test_analysis_records_prompt_version() -> None:
     )
 
     assert repo.analyses[content_id].prompt_version == "a1b2c3d4e5f60718"
+
+
+def test_claim_question_carries_the_three_heat_metrics() -> None:
+    """⭐ 迁移 0005 的三个热度列要**真的落到那行上**，不是收下就扔。
+
+    ⚠️ 这三个参数默认全是 `None`，所以"签名收了但忘了写进 `QuestionRow`"
+    在类型上完全合法、调用方一个错都不会报——只是库里那三列永远空着。
+    而热度是**非回溯**的：漏了一次，那次的值就永远拿不回来了。
+
+    ⚠️ `0` 和 `None` 要分得开：0 个关注是个合法观测值。这条同时用 0
+    和非 0 各钉一次（三列都可空、刻意不给 `default 0`，理由见 0005）。
+    """
+    repo = FakeRepo()
+
+    question_id = repo.claim_question(
+        "123",
+        "https://www.zhihu.com/question/123",
+        "标题",
+        description="描述",
+        follower_count=0,
+        view_count=84357,
+        answer_count=48,
+    )
+
+    assert question_id is not None
+    row = repo.all_questions()[0]
+    assert row.follower_count == 0, "0 个关注是观测值，不该退化成 None"
+    assert row.view_count == 84357
+    assert row.answer_count == 48
+
+
+def test_claim_question_leaves_the_heat_metrics_empty_when_not_given() -> None:
+    """不给就是 `None`——**不能自作主张填 0**。
+
+    能力五之前的所有调用方都不传这三个参数，它们进库的必须是"没采到"，
+    而不是"这道题 0 个关注、0 次浏览"。后者会让统计把整批老数据算成
+    真实的 0（迁移 0005 那三列可空、不给 `default 0` 就是为这件事）。
+    """
+    repo = FakeRepo()
+
+    question_id = repo.claim_question("123", None, None)
+
+    assert question_id is not None
+    row = repo.all_questions()[0]
+    assert (row.follower_count, row.view_count, row.answer_count) == (None, None, None)

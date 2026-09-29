@@ -270,15 +270,33 @@ class TestFromDocument:
     def test_unrecognised_content_type_is_refused(self, tmp_path: pathlib.Path) -> None:
         """⭐ 类型认不出来就**拒绝入库**，绝不兜底成 "unknown"。
 
-        库上写着 `check (content_type in (...))` 五个值。
+        库上写着 `check (content_type in (...))` 四个值（0004 起没有 question）。
         编一个枚举值出来的后果是：**插入那一刻**违反约束，
         炸掉的是一整批，而且报错信息指向 SQL 而不是"类型没认出来"。
         """
         row = self._row(tmp_path)
         assert extract.from_document({**row, "content_type": None}) is None
         assert extract.from_document({**row, "content_type": "pin"}) is None
-        for kind in extract.CONTENT_TYPES:
+        for kind in extract.FACT_CONTENT_TYPES:
             assert extract.from_document({**row, "content_type": kind}) is not None
+
+    def test_question_is_refused_here_even_though_we_can_parse_it(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """⭐ `question` **认识怎么解析，但不进 `fact_content`**（决策 29 / 迁移 0004）。
+
+        这条钉的是那对容易再次合流的集合：`JSON_ENTITY_KEYS`（认识怎么解析，
+        含 question）和 `FACT_CONTENT_TYPES`（能进库，不含 question）。
+
+        合流之后的失败方式是**静默的**：问题行一路走到 `insert_content`，
+        撞在 check 约束上，炸掉的是**一整批**——而报错指向 SQL 约束名，
+        不指向"问题不该走这条路"。问题的正路是 `claim_question` 进 `dim_question`。
+        """
+        row = self._row(tmp_path)
+        assert extract.from_document({**row, "content_type": "question"}) is None
+        assert "question" not in extract.FACT_CONTENT_TYPES
+        # 但解析那一侧必须还认识它：能力五要读问题页里的实体
+        assert "question" in extract.JSON_ENTITY_KEYS
 
     def test_missing_id_or_url_is_refused(self, tmp_path: pathlib.Path) -> None:
         """两个必填项：`zhihu_id` 是 `not null`，`url` 是唯一约束和去重的依据。"""
@@ -448,9 +466,16 @@ class TestJsonState:
         assert extract.find_entity(state, None, "1") is None
         assert extract.find_entity(state, "answer", None) is None
 
-    def test_every_content_type_has_a_bucket(self) -> None:
-        for kind in extract.CONTENT_TYPES:
-            assert kind in extract.JSON_ENTITY_KEYS, f"{kind} 没有对应的实体名"
+    def test_every_storable_type_is_also_parsable(self) -> None:
+        """⭐ 子集关系：**能进库的，必须都是我们认识怎么解析的。**
+
+        ⚠️ 方向只有一个，别写反也不要写成相等：反过来要求"能解析的都能入库"
+        会被 `question` 当场证伪（认识怎么解析，但不进 `fact_content`）。
+        这正是原来那条 `for kind in CONTENT_TYPES` 丢失的信息——
+        它遍历的是子集，所以 `question` 的实体名哪天被删掉也照样绿，
+        而能力五读问题页用的正是那个实体名。
+        """
+        assert set(extract.FACT_CONTENT_TYPES) <= set(extract.JSON_ENTITY_KEYS)
 
 
 class TestCrossCheckAgainstRealSnapshots:

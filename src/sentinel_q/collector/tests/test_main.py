@@ -29,8 +29,17 @@ from pathlib import Path
 import pytest
 
 from sentinel_q.collector import __main__ as cli
-from sentinel_q.collector import answers, comments, content, extract, ops, parse
+from sentinel_q.collector import (
+    answers,
+    comments,
+    content,
+    extract,
+    ops,
+    parse,
+    question,
+)
 from sentinel_q.shared.config import Paths
+from sentinel_q.shared.urlnorm import normalize
 
 # ── probe 的参数转发 ────────────────────────────────────────────────
 
@@ -72,7 +81,7 @@ class TestIsProbe:
         assert cli._is_probe(["content", "--url", "https://www.zhihu.com/pin/probe"]) is None
 
     def test_other_subcommands_are_not_probe(self) -> None:
-        for command in ("search", "content", "comments", "answers", "status"):
+        for command in ("search", "question", "content", "comments", "answers", "status"):
             assert cli._is_probe([command]) is None, command
 
     def test_empty_argv_is_not_probe(self) -> None:
@@ -94,6 +103,7 @@ class TestParser:
         assert len(actions) == 1
         assert set(actions[0].choices) == {
             "search",
+            "question",
             "content",
             "comments",
             "answers",
@@ -148,6 +158,11 @@ class TestParser:
         assert parser.parse_args(["answers", "--mode", "update"]).mode == "update"
         with pytest.raises(SystemExit):
             parser.parse_args(["content", "--mode", "update"])
+        # ⚠️ 能力五同理，而且理由更强一点：它连"这条采过没有"都不问口径，
+        #    断点就是 `questions.jsonl` 里的 qid。加个 `--mode` 只会让人
+        #    以为它能改变什么（`cmd_question` 的 docstring）。
+        with pytest.raises(SystemExit):
+            parser.parse_args(["question", "--mode", "update"])
 
     def test_the_collector_has_no_database_switch_at_all(self) -> None:
         """⭐ 采集模块**一个库开关都没有**（决策 52）。
@@ -164,7 +179,7 @@ class TestParser:
         这里只管命令行那一面。
         """
         parser = cli.build_parser()
-        for command in ("search", "content", "comments", "answers"):
+        for command in ("search", "question", "content", "comments", "answers"):
             assert not hasattr(parser.parse_args([command]), "no_db"), command
             with pytest.raises(SystemExit):
                 parser.parse_args([command, "--no-db"])
@@ -685,3 +700,309 @@ class TestAnswersNeverCollectsComments:
         args = ["answers", "--question", "123", "--with-comments"]
         with pytest.raises(SystemExit):
             cli.build_parser().parse_args(args)
+
+
+# ── 能力五：按问题页取详情，落 questions.jsonl ──────────────────────
+
+
+QUESTION = "https://www.zhihu.com/question/555"
+
+SECOND_QUESTION = "https://www.zhihu.com/question/666"
+"""⭐ **第二个问题的 URL 必须和第一个不同**——能力五按 qid 挡重，
+两道题共用一个地址的话，"逐条采"会退化成"反复采同一道题"，而测试看不出来。"""
+
+ANSWER_ON_QUESTION = "https://www.zhihu.com/question/555/answer/777"
+"""清单里混进来的**非问题页**。能力一搜出来的是内容页，不只有问题。"""
+
+
+def _questions_rows(root: Path) -> list[dict]:
+    """把这次落盘的问题详情读回来。**断言的是文件，不是内存里的对象。**"""
+    files = sorted(_ops_dir(root).glob("*/questions.jsonl"))
+    assert len(files) <= 1, f"应该有至多一次任务目录，实际 {files}"
+    if not files:
+        return []
+    return [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines()]
+
+
+class _QuestionsRun:
+    """一次假的 `cmd_question`：记录开了哪些页面、落盘了什么。
+
+    ⚠️ 这个假对象**不提供 `_policy` / `_page_html` / `_cross_check` 的替身**：
+    能力五**不落快照、不做交叉验证**（`dim_question` 没有 `snapshot_path` 列，
+    而"文件写了、库里没指针"是 `extract.to_document` 警告过的那种错）。
+    由 `test_no_snapshot_and_no_cross_check_is_ever_touched` 把这件事钉死——
+    光"不提供替身"挡不住什么都不发生。
+    """
+
+    def __init__(self) -> None:
+        self.opened: list[str] = []
+        self.fail_all = False
+        self.detail = None  # 造"详情不完整"的场景用
+
+    def install(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setattr(cli, "paths", lambda: Paths.resolve(tmp_path))
+        monkeypatch.setattr(cli, "_require_calibrated", lambda: None)
+        monkeypatch.setattr(cli, "BrowserSession", _FakeBrowserSession)
+        monkeypatch.setattr(question, "extract_question", self._question)
+
+    def run(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *argv: str) -> int:
+        self.install(monkeypatch, tmp_path)
+        args = cli.build_parser().parse_args(["question", *argv])
+        return cli.cmd_question(args)
+
+    def _question(self, session, url):
+        """照 URL 编一条详情——qid 从 URL 推，和真实现同一条口径。"""
+        normalized = normalize(url)
+        qid = normalized.zhihu_id if normalized else "0"
+        self.opened.append(url)
+        if self.fail_all:
+            return question.QuestionReport(url=url, reason=question.REASON_NO_JSON)
+        detail = self.detail or question.QuestionDetail(
+            zhihu_qid=qid,
+            url=normalized.url,
+            title=f"问题 {qid}",
+            description="描述",
+            follower_count=71,
+            view_count=84357,
+            answer_count=48,
+        )
+        return question.QuestionReport(url=url, detail=detail)
+
+
+class TestQuestionDocument:
+    """⭐ 能力五的产物：`questions.jsonl`，进 `dim_question` 的那几列。
+
+    它是"采集 → 入库"的衔接面（决策 53 第②步）。采集模块自己不连库
+    （决策 52），所以这份文件就是能力的**全部**产出——不落它，一趟采集
+    跑完什么都不剩。
+    """
+
+    def test_the_detail_lands_in_the_document(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        run = _QuestionsRun()
+        assert run.run(monkeypatch, tmp_path, "--url", QUESTION) == 0
+
+        rows = _questions_rows(tmp_path)
+        assert len(rows) == 1
+        assert rows[0]["zhihu_qid"] == "555"
+        assert rows[0]["title"] == "问题 555"
+        assert rows[0]["description"] == "描述"
+        assert (rows[0]["follower_count"], rows[0]["view_count"]) == (71, 84357)
+        assert (rows[0]["answer_count"], rows[0]["collected_at"]) != (None, None)
+
+    def test_a_rerun_does_not_write_the_same_question_twice(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """⚠️ 验收流程是「先 `--limit` 冒烟、再全量」，两次撞的是同一批问题。"""
+        run = _QuestionsRun()
+        assert run.run(monkeypatch, tmp_path, "--url", QUESTION) == 0
+        first = _questions_rows(tmp_path)
+
+        assert run.run(monkeypatch, tmp_path, "--url", QUESTION) == 0
+        assert _questions_rows(tmp_path) == first, "重跑一遍，行数不该变"
+
+    def test_the_limit_is_applied_after_the_dedup(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """⭐ `--limit` 数的是**这次要采的**，不是清单的前 N 条。
+
+        ⚠️ 顺序反了的话，冒烟会变成空转：清单第一条已经采过（占掉了那个
+        名额），于是"`--limit 1` 跑一趟"什么都没采，而退出码是 0、
+        日志里一句"没有要采的"——看着像跑通了。
+        """
+        run = _QuestionsRun()
+        assert run.run(monkeypatch, tmp_path, "--url", QUESTION) == 0
+
+        assert (
+            run.run(
+                monkeypatch,
+                tmp_path,
+                "--url",
+                QUESTION,
+                "--url",
+                SECOND_QUESTION,
+                "--limit",
+                "1",
+            )
+            == 0
+        )
+
+        assert [r["zhihu_qid"] for r in _questions_rows(tmp_path)] == ["555", "666"]
+
+    def test_the_keyword_rides_along_from_the_url_list(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """`urls.jsonl` 里的关键词要一路带到文档里（同能力二）。
+
+        不带上就说不清"这道题是哪次搜索捞出来的"——人工核对时最常问的。
+        """
+        run = _QuestionsRun()
+        _seed_run(
+            tmp_path,
+            "20260101-000000",
+            [ops.UrlEntry(url=QUESTION, keyword="某公司")],
+        )
+
+        assert run.run(monkeypatch, tmp_path, "--run", "20260101-000000") == 0
+
+        assert _questions_rows(tmp_path)[0]["keyword"] == "某公司"
+
+    def test_a_question_that_was_not_collected_writes_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """没取到就**不留行**——留一行空的比没有更难核对。
+
+        ⚠️ 也不能"拿别的问题的数据顶上"：`dim_question` 上的描述和热度是
+        **抢占那一刻冻结**的（迁移 0005），第一份写进去什么就永久是什么。
+        """
+        run = _QuestionsRun()
+        run.fail_all = True
+
+        assert run.run(monkeypatch, tmp_path, "--url", QUESTION) == 1
+        assert _questions_rows(tmp_path) == []
+
+    def test_the_document_lands_in_the_run_it_was_given(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """`--run` 指到哪就写进哪个任务目录（跟能力二、四同一条口径）。
+
+        能力五常常是接着一次能力一的任务跑的，写错目录就等于**验收时
+        在清单旁边找不到产物**，而那两样本来就是对着看的。
+        """
+        run = _QuestionsRun()
+        _seed_run(tmp_path, "20260101-000000", [ops.UrlEntry(url=QUESTION)])
+
+        assert run.run(monkeypatch, tmp_path, "--run", "20260101-000000") == 0
+
+        assert sorted(_ops_dir(tmp_path).iterdir()) == [
+            _ops_dir(tmp_path) / "20260101-000000"
+        ], "不该另开一个任务目录"
+
+    def test_nothing_to_do_does_not_open_a_browser(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """⭐ 全采过了就**不开浏览器**，直接返回 0。
+
+        ⚠️ 这不是省时间的问题：开浏览器要打一次知乎，是这套系统里唯一
+        会造成外部可见行为的一步。一次"其实没活干"的运行不该留下痕迹。
+        """
+        run = _QuestionsRun()
+        assert run.run(monkeypatch, tmp_path, "--url", QUESTION) == 0
+        run.opened.clear()
+
+        assert run.run(monkeypatch, tmp_path, "--url", QUESTION) == 0
+        assert run.opened == [], "没有要采的就不该打开任何页面"
+
+
+class TestQuestionTargets:
+    """⭐ 从清单里挑问题页——**挑错的后果是采回一堆别的东西**。"""
+
+    def test_only_question_pages_are_opened(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """`--run` 的清单里混着回答是正常的，`extract_question` 一次都不该被调到它上面。
+
+        ⚠️ 真实现里这一步不是可有可无的过滤：`question.extract_question`
+        拿回答页的 URL 会拒（`REASON_NOT_A_QUESTION`），但那是**采完一次
+        才发现**——浏览器已经开过、页面已经打过。在这里挡掉才是真的省下那一次。
+        """
+        run = _QuestionsRun()
+        _seed_run(
+            tmp_path,
+            "20260101-000000",
+            [
+                ops.UrlEntry(url=ANSWER),
+                ops.UrlEntry(url=QUESTION),
+                ops.UrlEntry(url="https://zhuanlan.zhihu.com/p/123456"),
+            ],
+        )
+
+        assert run.run(monkeypatch, tmp_path, "--run", "20260101-000000") == 0
+
+        assert run.opened == [QUESTION], "只该打开问题页"
+
+    def test_the_refused_urls_are_counted_not_silently_skipped(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog
+    ) -> None:
+        """被挡掉的条数**必须报出来**。
+
+        静默跳过的结果是"跑了、报告说 0 条、看起来像没问题"——而真相是
+        清单给错了（比如整批都是回答页）。这是本项目最不想要的那种反馈。
+        """
+        import logging
+
+        run = _QuestionsRun()
+        _seed_run(
+            tmp_path,
+            "20260101-000000",
+            [ops.UrlEntry(url=ANSWER), ops.UrlEntry(url=QUESTION)],
+        )
+
+        with caplog.at_level(logging.WARNING):
+            assert run.run(monkeypatch, tmp_path, "--run", "20260101-000000") == 0
+
+        assert "1 条不是问题页" in caplog.text
+        assert ANSWER in caplog.text, "要说清楚是哪几条"
+
+    def test_a_url_that_is_not_a_question_is_refused_before_the_browser(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """`--url` 手给一条回答地址 → **当场报错，不开浏览器**。
+
+        同 `cmd_content` 的规矩：命令行的错必须在"碰环境"之前报出来。
+        反过来的话，人会先看到浏览器起不来、跑去查浏览器，再跑一遍才发现
+        是 URL 给错了——而那是两件无关的事。
+        """
+        run = _QuestionsRun()
+
+        with pytest.raises(SystemExit, match="没给问题页 URL"):
+            run.run(monkeypatch, tmp_path, "--url", ANSWER)
+        assert run.opened == []
+
+    def test_a_normalised_url_is_what_gets_opened(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """开的是**规范化后**的地址，和落盘的 `url` 那一列同一个形态。
+
+        ⚠️ 不规范化的话，"采过的 qid"和"要采的 qid"会对不上，
+        同一道题每跑一次采一次（断点形同虚设）。
+        """
+        run = _QuestionsRun()
+
+        assert run.run(monkeypatch, tmp_path, "--url", f"{QUESTION}?sort=created#x") == 0
+
+        assert run.opened == [QUESTION]
+        assert _questions_rows(tmp_path)[0]["url"] == QUESTION
+
+
+class TestQuestionTouchesNothingElse:
+    """⭐ 能力五只做一件事：读 `js-initialData`，写 `questions.jsonl`。"""
+
+    def test_no_snapshot_and_no_cross_check_is_ever_touched(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """**不落快照、不做交叉验证**——两个都换成会炸的替身来证明。
+
+        ⚠️ 快照：`dim_question` 没有 `snapshot_path` 列，落了文件也没有
+        指针指过去，而"文件写了、库里没指针"（反过来也一样）正是
+        `extract.to_document` 的 docstring 警告过的那种错。
+
+        ⚠️ 交叉验证：它的输入是 DOM 文本，用来判"正文是不是被截断了"。
+        能力五**不读 DOM**（描述全文本来就在 JSON 里），所以它没有可比
+        的第二个来源——调它只会拿到一句"未验证"，白白多一处会失败的地方。
+
+        用"会炸的替身"而不是"断言没被调用"：真实现哪天加了一条
+        `try: _cross_check(...) except: pass`，前者照样炸，后者会静静放过。
+        """
+        run = _QuestionsRun()
+
+        def _explode(*args: object, **kwargs: object) -> None:
+            raise AssertionError("能力五不该碰快照，也不该碰交叉验证")
+
+        monkeypatch.setattr(cli, "_policy", _explode)
+        monkeypatch.setattr(cli, "_page_html", _explode)
+        monkeypatch.setattr(cli, "_cross_check", _explode)
+
+        assert run.run(monkeypatch, tmp_path, "--url", QUESTION) == 0
+        assert _questions_rows(tmp_path), "东西还是得落盘"

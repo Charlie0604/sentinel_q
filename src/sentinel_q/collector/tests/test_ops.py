@@ -286,3 +286,54 @@ def test_a_shard_is_persisted_so_it_can_be_resumed(tmp_path: Path) -> None:
 
     assert store.load_shard("小王") == ["甲", "丙"]
     assert store.load_shard("小李") == []  # 还没切给自己，不是错误
+
+
+def test_questions_is_a_product_file_but_not_a_body_file(tmp_path: Path) -> None:
+    """⭐ 能力五的 `questions.jsonl` 能落盘，但**不能混进 `BODY_FILES`**。
+
+    两个集合管的是两件事：
+
+        BODY_FILES     哪些行装得成 `ContentRecord`、能进 `fact_content`
+        PRODUCT_FILES  这个任务**全部产物文件**（`body_path()` 的白名单）
+
+    ⚠️ 把 `questions` 加进 `BODY_FILES` 会**静默弄坏三个夹具脚本**
+    （`ingest_fixture` / `replay_fixture` / `judge_fixture` 里的
+    `for name in ops.OpsStore.BODY_FILES:`）——问题详情的行里没有
+    `zhihu_id`，`extract.from_document` 会一条条拒掉、逐行打
+    "装不成记录"，于是它们报出来的那个数凭空多出问题的行数。
+    而**那个数是多份 README 里写明的验收基准**。
+
+    这条用例拿"真的去遍历一遍"来证明，而不是只比两个元组：断言的是
+    那三个脚本的行为，不是常量的拼写。
+    """
+    from sentinel_q.collector import extract
+    from sentinel_q.collector.ops import OpsStore
+
+    assert "questions" in OpsStore.PRODUCT_FILES
+    assert "questions" not in OpsStore.BODY_FILES, "混进去会弄坏三个夹具脚本的验收数字"
+
+    store = OpsStore.new_run(tmp_path, mode="backfill", run_id="r1")
+    store.append_contents([{"zhihu_qid": "1", "title": "标题"}], name="questions")
+    # ⚠️ 正文那边也真写一行。不留的话下面那次遍历是空的，
+    #    "装不出记录"就成了废话——空集合当然装不出任何东西。
+    store.append_contents(
+        [
+            {
+                "content_type": "answer",
+                "zhihu_id": "456",
+                "url": "https://www.zhihu.com/question/1/answer/456",
+            }
+        ]
+    )
+
+    # 能写能读（白名单放行了）……
+    assert [r["zhihu_qid"] for r in store.iter_contents(name="questions")] == ["1"]
+    assert store.body_path("questions").name == "questions.jsonl"
+
+    # ……但夹具脚本那套遍历里**只有正文那一行**：问题详情那一行根本不在，
+    #    所以它们报出来的"装不成记录"不会凭空多出问题的行数。
+    rows = [r for name in OpsStore.BODY_FILES for r in store.iter_contents(name=name)]
+    assert [r.get("zhihu_id") for r in rows] == ["456"], (
+        "遍历 BODY_FILES 只该看见正文——问题详情不在里面"
+    )
+    assert extract.from_document(rows[0]) is not None, "正文那一行照样装得成"

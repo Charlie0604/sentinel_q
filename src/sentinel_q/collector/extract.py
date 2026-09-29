@@ -46,11 +46,18 @@ INLINE_LIMIT = 500
 （实测最长的一条 200 多字），所以**绝大多数评论是内联存的**，没有文件开销。
 """
 
-CONTENT_TYPES: frozenset[str] = frozenset(
-    {"question", "answer", "article", "thought", "comment"}
+FACT_CONTENT_TYPES: frozenset[str] = frozenset(
+    {"answer", "article", "thought", "comment"}
 )
-"""`fact_content.content_type` 的 check 约束里那五个值。**与库上的约束必须一字不差。**
-改这里之前先改迁移脚本，否则代码会写进一个库拒收的值。"""
+"""**能进 `fact_content` 的类型**（`ContentRecord.content_type` 的一个子集）。
+与库上那条 check 约束必须一字不差。改这里之前先改迁移脚本，
+否则代码会写进一个库拒收的值。
+
+⚠️ 2026-09-28（迁移 0004）起**没有 `question`**：问题只进 `dim_question`，
+不进 `fact_content`（决策 29 已重写）。所以这里是 **4 个，而下面的
+`JSON_ENTITY_KEYS` 是 5 个——两个集合故意不一样，别顺手对齐**：
+那个管的是"认识怎么解析"，问题页仍然要解析（能力五要读它页面里的实体）。
+"""
 
 JSON_ENTITY_KEYS: dict[str, str] = {
     "question": "questions",
@@ -59,7 +66,12 @@ JSON_ENTITY_KEYS: dict[str, str] = {
     "thought": "pins",
     "comment": "comments",
 }
-"""`ContentRecord.content_type` → `js-initialData` 里对应的实体名。实测的键名。"""
+"""`ContentRecord.content_type` → `js-initialData` 里对应的实体名。实测的键名。
+
+⚠️ 这是"**认识怎么解析**"那一侧：它比 `FACT_CONTENT_TYPES` 多一个 `question`。
+所以 `CONTENT_TYPES` 那个旧名字**不能当判据**——拿它当"能不能入库"用，
+问题页就会被放行到 `insert_content`，然后撞在 check 约束上。
+"""
 
 TIER1_VERIFIED: frozenset[str] = frozenset({"question", "answer", "article"})
 """第一档**实测有效**的页面类型。其余类型不要拿它下结论。
@@ -297,6 +309,13 @@ def extract_json_state(html: str) -> dict | None:
         # 知乎换掉这个 script 的形态了。不是错误——第一档本来就是加分项，
         # 缺了它 DOM 路径照样跑，只是少一层交叉验证。
         return None
+    # ⚠️ 先确认它是个对象再 `.get()`：JSON 合法但顶层是字符串/数组/数字时，
+    #    以前会当场 `AttributeError` 抛出去。这跟本函数自己那句"读不动返回
+    #    None"是矛盾的，而且调用方（`question.detail_from_html`、
+    #    `cross_check_json`）都按"不抛"写的——一次形态变化会从
+    #    "少一层交叉验证"变成"整批中断"。
+    if not isinstance(data, dict):
+        return None
     state = data.get("initialState")
     return state if isinstance(state, dict) else None
 
@@ -352,7 +371,7 @@ def cross_check_json(item: parse.ParsedItem, page_html: str) -> CrossCheck:
 
     dom_length = len(item.text or "")
     raw = entity.get("content")
-    json_length = len(_text_of(raw)) if raw else None
+    json_length = len(html_to_text(raw)) if raw else None
     flag = entity.get(_TRUNCATED_FLAG)
     truncated = flag if isinstance(flag, bool) else None
 
@@ -384,8 +403,16 @@ def cross_check_json(item: parse.ParsedItem, page_html: str) -> CrossCheck:
     )
 
 
-def _text_of(raw: object) -> str:
-    """JSON 里的正文是 HTML，转成文本再比长度。"""
+def html_to_text(raw: object) -> str:
+    """JSON 里的正文是 HTML，转成文本。
+
+    ⚠️ **公开的**（原 `_text_of`）：`question.py` 要用它把问题描述从
+    `detail` 那段 HTML 转成纯文本。不叫 `text_of` 是因为
+    `drive.text_of(target, selector)` 已经占了这个名字，含义还不一样
+    （那个是"按选择器取元素文案"）。
+
+    传进来的不是字符串就返回空串——**不抛**。调用方据此判断"这条没有正文"。
+    """
     if not isinstance(raw, str):
         return ""
     return BeautifulSoup(raw, "html.parser").get_text("\n", strip=True)
@@ -491,12 +518,14 @@ def from_document(row: Mapping) -> ContentRecord | None:
             url or content_type,
         )
         return None
-    if content_type not in CONTENT_TYPES:
+    if content_type not in FACT_CONTENT_TYPES:
         log.warning(
-            "%s 的内容类型认不出来（%r），不入库——库上的枚举约束只认 %s",
+            "%s 的内容类型不进 fact_content（%r），跳过——库上的枚举约束只认 %s。"
+            "⚠️ 问题的正路是 claim_question 进 dim_question（决策 29），"
+            "不是从 contents.jsonl 进来",
             url,
             content_type,
-            "/".join(sorted(CONTENT_TYPES)),
+            "/".join(sorted(FACT_CONTENT_TYPES)),
         )
         return None
 

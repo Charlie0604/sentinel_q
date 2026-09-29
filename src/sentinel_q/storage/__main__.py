@@ -3,6 +3,8 @@
     python -m sentinel_q.storage status               # 看迁移跑到哪了
     python -m sentinel_q.storage migrate --dry-run    # 只打印计划，一个字节都不写
     python -m sentinel_q.storage migrate              # 真的推到库上
+    python -m sentinel_q.storage migrate --accept-drift 0002_prompt -n "理由"
+                                                      # 确认某个漂移只是正文变了
     python -m sentinel_q.storage prompts pull         # 从线上库拉提示词到本地工作区
     python -m sentinel_q.storage prompts push -v 3    # 把本地工作区推上库，标记版本 3
 
@@ -56,20 +58,36 @@ def _report(migration: migrate.Migration, applied: dict[str, str]) -> str:
     return f"  已执行  {migration.version}"
 
 
+def _drift_reports(result: migrate.Plan, stored: dict[str, str]) -> str:
+    """每个漂移的版本展开一条详细说明（差异 + 接受漂移的命令行）。
+
+    `stored` 是 `read_state` 读回来的"执行时正文"，没存过的版本没有键——
+    `drift_report` 会自己说"打不出差异"。
+    """
+    return "\n".join(
+        migrate.drift_report(m, recorded=recorded, stored_sql=stored.get(m.version))
+        for m, recorded in result.drifted
+    )
+
+
 def cmd_status(args: argparse.Namespace) -> int:
-    """列出三个迁移各自的状态。漂移或孤儿时退出码 1，方便脚本判断。"""
+    """列出每个迁移的状态。漂移或孤儿时退出码 1，方便脚本判断。"""
     found = migrate.discover(MIGRATIONS_DIR)
     if not found:
         print(f"{MIGRATIONS_DIR} 下没有迁移文件。")
         return 0
 
     with migrate.connect(_dsn()) as conn:
-        applied = migrate.read_applied(conn) if migrate.tracking_exists(conn) else {}
+        # ⚠️ read_state 而不是 ensure_tracking：status 是诊断，不建表不加列。
+        applied, stored = migrate.read_state(conn)
         result = migrate.plan(applied, found)
 
     print(f"迁移目录：{MIGRATIONS_DIR}")
     for migration in found:
         print(_report(migration, applied))
+    if result.drifted:
+        print()
+        print(_drift_reports(result, stored))
     if result.orphaned:
         print("  ⚠️ 库里有、文件里没有：" + "、".join(result.orphaned))
     if result.drifted or result.orphaned:
@@ -79,34 +97,130 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _check_driftable(target: migrate.Migration, recorded: str | None) -> str:
+    """`--accept-drift` 的前置：这个版本必须**确实在漂移**。返回确认过的旧校验和。
+
+    三种"没有漂移可接受"都当场停下并退非 0：这里每一次都是空操作，
+    脚本里不该把它当成成功。
+    """
+    if recorded is None:
+        raise SystemExit(
+            f"❌ {target.version} 还没执行过，没有漂移可接受。直接跑 migrate 就行。"
+        )
+    if recorded == target.checksum:
+        raise SystemExit(
+            f"❌ {target.version} 和库里记的一致，没有漂移可接受（这次什么都没做）。"
+        )
+    return recorded
+
+
+def _accept_drift(args: argparse.Namespace, found: list[migrate.Migration]) -> int:
+    """把"我确认过 DDL 没变"记进库。见 `migrate.accept_drift` 的 docstring。
+
+    ⚠️ `--dry-run` 走只读的 `read_state`（不建表不加列），真跑才 `ensure_tracking`。
+    """
+    note = (args.note or "").strip()
+    if not note:
+        raise SystemExit(
+            "❌ --accept-drift 必须配一句 -n/--note，说明为什么可以放行。\n"
+            "   这条记录是将来唯一能回答「当初为什么接受这次漂移」的地方。\n"
+            f"   例：migrate --accept-drift {args.accept_drift}"
+            ' -n "只改了注释里的仓库路径，DDL 未变"'
+        )
+
+    target = next((m for m in found if m.version == args.accept_drift), None)
+    if target is None:
+        raise SystemExit(
+            f"❌ 没有 {args.accept_drift} 这个迁移文件。\n"
+            "   版本号取文件名去掉 .sql，如 0002_prompt。"
+        )
+
+    if args.dry_run:
+        with migrate.connect(_dsn()) as conn:
+            applied, stored = migrate.read_state(conn)
+        print("（--dry-run，一个字节都不会写）")
+        recorded = _check_driftable(target, applied.get(target.version))
+        print(
+            migrate.drift_report(
+                target, recorded=recorded, stored_sql=stored.get(target.version)
+            )
+        )
+        print("\n将要记账：")
+        print(f"  checksum                ← {target.checksum}")
+        print(f'  applied_sql             ← 当前文件的正文（{len(target.sql)} 字符）')
+        print(f"  accepted_from_checksum  ← {recorded}")
+        print(f'  accepted_note           ← "{note}"')
+        return 0
+
+    with migrate.connect(_dsn()) as conn:
+        migrate.ensure_tracking(conn)
+        applied, stored = migrate.read_state(conn)
+        recorded = _check_driftable(target, applied.get(target.version))
+        print(
+            migrate.drift_report(
+                target, recorded=recorded, stored_sql=stored.get(target.version)
+            )
+        )
+        # 先把对得上的老行补上，再接受这一个：两件事都是记账，顺序不影响结果。
+        migrate.backfill_applied_sql(conn, found, applied, stored)
+        migrate.accept_drift(conn, target, note=note, recorded=recorded)
+
+    print(
+        f"\n✅ 已接受 {target.version} 的漂移"
+        f"（{recorded[:12]}… → {target.checksum[:12]}…），理由已记进库。"
+    )
+    print("   现在跑 migrate 就会继续了。")
+    return 0
+
+
 def cmd_migrate(args: argparse.Namespace) -> int:
     found = migrate.discover(MIGRATIONS_DIR)
     if not found:
         print(f"{MIGRATIONS_DIR} 下没有迁移文件，无事可做。")
         return 0
 
+    if args.accept_drift:
+        # 一旦给了版本号就**只做这一件事**，不顺手把迁移也跑了：
+        # "我确认过"和"库真的变了"是两件事，分开做，各自留痕。
+        return _accept_drift(args, found)
+
     with migrate.connect(_dsn()) as conn:
         if args.dry_run:
             # ⚠️ 这条分支里**一个写操作都不能有**，包括建 schema_migrations。
-            # 所以用只读的 tracking_exists 探一下，而不是 ensure_tracking。
-            applied = migrate.read_applied(conn) if migrate.tracking_exists(conn) else {}
+            # 所以用只读的 read_state 探一下，而不是 ensure_tracking。
+            applied, stored = migrate.read_state(conn)
             result = migrate.plan(applied, found)
             print("（--dry-run，一个字节都不会写）")
             print(result.describe())
+            if result.drifted:
+                print()
+                print(_drift_reports(result, stored))
             if result.blocked:
                 print("\n⚠️ 上面这些对不上，真跑的话会被拦下。见 migrations/README.md。")
             return 0
 
         migrate.ensure_tracking(conn)
-        applied = migrate.read_applied(conn)
+        applied, stored = migrate.read_state(conn)
+        filled = migrate.backfill_applied_sql(conn, found, applied, stored)
+        if filled:
+            # 哈希对得上就是"文件和当初执行的那一版逐字节相同"的证明，
+            # 所以补进去的**确实是当初跑的那一版**，不是猜的。
+            print("已把执行时的正文补进库：" + "、".join(filled) + "。")
         result = migrate.plan(applied, found)
 
         if result.blocked:
             print(result.describe())
+            if result.drifted:
+                print()
+                print(_drift_reports(result, stored))
             raise SystemExit(
                 "❌ 已执行过的迁移文件被改动过（或文件被删了），**一个都没执行**。\n"
                 "   库和文件已经不是同一份契约，继续跑只会把偏差滚大。\n"
-                "   改法：把文件改回原样，或者新增一个编号（migrations/README.md）。"
+                "   改法三条，按代价从小到大（migrations/README.md）：\n"
+                "     ① 把文件改回原样\n"
+                "     ② 新增一个编号，旧文件不动\n"
+                "     ③ 确认过表结构没变的话：\n"
+                '        migrate --accept-drift <版本号> -n "<一句理由>"'
             )
 
         if not result.pending:
@@ -170,6 +284,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="只打印计划，一个字节都不写（连 schema_migrations 都不建）",
+    )
+    p_migrate.add_argument(
+        "--accept-drift",
+        metavar="版本号",
+        help=(
+            "确认某个已执行的迁移只是正文变了、表结构没变，把这个判断记进库"
+            "（必须配 --note，一次只认一个版本）"
+        ),
+    )
+    p_migrate.add_argument(
+        "-n",
+        "--note",
+        help="接受漂移的理由；给了 --accept-drift 就必填",
     )
     p_migrate.set_defaults(func=cmd_migrate)
 

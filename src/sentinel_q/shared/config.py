@@ -102,7 +102,23 @@ class Settings:
 
     supabase_dsn: str | None  # Postgres 连接串，不是 REST URL——见 storage/supabase.py 开头
     llm_api_key: str | None
+    llm_base_url: str | None  # OpenAI 兼容的接口根地址，如 https://api.deepseek.com
     llm_model: str
+    llm_reasoning_effort: str
+    """思考强度：`none` / `low` / `high` / `max`，**空串 = 不传这个字段、用服务端默认**。
+
+    ⚠️ **这不是个调优项，是个花钱项。** DeepSeek 的 `deepseek-flash` 默认
+    `reasoning_effort=high`——不传就是最高档，每判一条都在烧推理 token，
+    而这是个分类任务。所以这里默认给 `none`（关掉思考）。
+
+    ⚠️ **思考模式下 `temperature` 不生效**（服务端明确忽略），所以关掉思考还顺带
+    让 `TEMPERATURE = 0` 那个"同一输入问两遍得到同一个答案"的保证真的成立。
+
+    合法的旧别名：`minimal`→`low`、`medium`/`xhigh`→`high`。真正支持的取值以
+    服务端为准（`GET /models` 会回 `effort.supported_levels`）；写错了是个 4xx，
+    客户端**不重试**、当场把原始报文打出来，不会白烧配额。
+    """
+
     batch_size: int
 
     @classmethod
@@ -111,7 +127,13 @@ class Settings:
         return cls(
             supabase_dsn=os.getenv("SUPABASE_DSN"),
             llm_api_key=os.getenv("LLM_API_KEY"),
-            llm_model=os.getenv("LLM_MODEL", "claude-sonnet-5"),
+            # ⚠️ **不给默认值**。模型名和地址是一对，猜一个地址只会让人对着 404
+            #    查半天；缺了就在 analyst/client.py 的 from_settings 里当场报错。
+            llm_base_url=os.getenv("LLM_BASE_URL"),
+            # 默认值对着架构文档 4.3 写的工具（DeepSeek V4 Flash）。模型名和地址是一对，
+            # 两边对不上时第一次真调 API 就是 400 model not found。
+            llm_model=os.getenv("LLM_MODEL", "deepseek-flash"),
+            llm_reasoning_effort=os.getenv("LLM_REASONING_EFFORT", "none"),
             batch_size=int(os.getenv("AI_BATCH_SIZE", "8")),
         )
 

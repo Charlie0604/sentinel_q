@@ -3,12 +3,35 @@
     python -m sentinel_q.analyst run --batch 8      # 跑一轮分析
     python -m sentinel_q.analyst run --once         # 只跑一轮就退出
 
-## 事件分类也归这里（原"模块四"，决策 52）
+## ⚠️ `run` **还没接上**——但库已经在了
 
-它和内容判定是**同一套机器**——拼 prompt → 调模型 → 解析答复 → 落一张 fact 表，
-只差 prompt 内容和落哪张表（`fact_content_event`）。原 `modules/m4_classifier`
-的独立入口已随重构删除，将来在这里加一个 `event` 子命令即可。
-预筛查询见 4.5.2 ⚠️ 匹配集必须含 `ai_summary`，否则会漏掉全部长内容。
+这一轮的边界是"只做纯函数库"：三个任务的判定机器写完了，缺的是**文件层**。
+
+    client.py         模型调用 + 答复解析（httpx 延迟 import，见文件开头）
+    batch.py          并发推 N 条 + 一返回就回调（4.2 / 决策 39）
+    judge_content.py  任务 A：正文 → fact_analysis
+    judge_question.py 任务 B：问题 → dim_question.is_relevant
+    judge_event.py    事件任务（原"模块四"）→ fact_content_event
+    fake.py           不联网的模型客户端：离线跑通一条判定就靠它
+
+离线自测长这样（**一次真实 API 都不调**）：
+
+    from sentinel_q.analyst import judge_content
+    from sentinel_q.analyst.fake import FakeLLMClient, full_bundle
+    judgment = judge_content.judge_one(pending, bundle=full_bundle(),
+                                       client=FakeLLMClient('{"is_relevant": true, ...}'))
+
+`run` 要干的是"读一份待判清单 → 逐条判 → 把结果写回同一行"（决策 51：
+断点与 AI 结果写在 `contents.jsonl` 同一行）。**那一头一尾都是文件操作，
+而 `contents.jsonl` 的读写现在在 `collector/ops.py` 里**——`analyst` import 它
+会当场破掉"模块之间不互相 import"这条硬规则（7.3 规则一）。
+所以文件层留在主程序那边，这一轮不接。
+
+## 提示词：一份 bundle，按任务拼
+
+三个任务的模块共用一份 bundle，靠模块名前缀区分（见 `shared/models.py` 的
+`PROMPT_MODULES`）。`PromptBundle.assemble("question")` 拼出来的串里
+一个 `c_tasks` 都不会有。
 
 ## ⚠️ `prompts pull` / `prompts push` **不在这里**（决策 52）
 
@@ -48,7 +71,11 @@ def main(argv: list[str] | None = None) -> int:
     paths().ensure()
 
     raise NotImplementedError(
-        f"分析尚未实现（batch={args.batch}）。任务 A/B 的设计见架构文档第四章。"
+        f"run 还没接上（batch={args.batch}）：三个任务的判定机器已经写好了"
+        "（judge_content / judge_question / judge_event），缺的是文件层——"
+        "读待判清单、把结果写回 contents.jsonl 同一行，那两件事都在主程序那边，"
+        "因为这个模块不碰 collector 的本地文件（7.3 规则一）。"
+        "要离线试判定逻辑，直接调 judge_*.judge_one 并喂一个假客户端。"
     )
 
 

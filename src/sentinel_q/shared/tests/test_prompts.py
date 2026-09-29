@@ -23,6 +23,8 @@ import json
 import shutil
 from pathlib import Path
 
+import pytest
+
 from sentinel_q.shared import prompts as prompt_loader
 from sentinel_q.shared.config import REPO_ROOT, Paths
 from sentinel_q.shared.models import PROMPT_MODULE_ORDER, PromptBundle
@@ -32,7 +34,17 @@ def _layout(tmp_path: Path, *, with_examples: bool = False) -> Paths:
     layout = Paths.resolve(tmp_path)
     layout.ensure()
     if with_examples:
-        shutil.copytree(REPO_ROOT / "prompts", layout.prompts, dirs_exist_ok=True)
+        # ⚠️ **只拷 `*.example`，不整目录拷。**
+        #
+        # `prompts/` 是**工作区**，不是仓库的一部分：真实提示词在那儿落地，
+        # 而它们是 gitignore 的（7.7）。所以本机跑过 `prompts pull` 的人，
+        # 那个目录里有 15 个 `.txt`；干净检出的人一个都没有。
+        #
+        # 整目录 `copytree` 会让下面两条测试的结果**取决于本机工作区的状态**——
+        # 同一个 commit，一台机器绿、另一台红，而且原因和被测代码毫无关系。
+        # 这两条测试要的是"工作区里只有模板"，那就只拷模板。
+        for example in sorted((REPO_ROOT / "prompts").glob("*.example")):
+            shutil.copy2(example, layout.prompts / example.name)
     return layout
 
 
@@ -59,11 +71,62 @@ def test_missing_modules_are_reported() -> None:
     assert "b_subject" in bundle.missing_modules()
 
 
+def test_missing_modules_can_be_scoped_to_one_task() -> None:
+    """`cmd_prompts push` 的降级警告按任务查：只有内容任务的模板齐了也得吵。"""
+    bundle = PromptBundle(version=1, content_hash="x", modules={"a_role": "AAA"})
+
+    assert "question_tasks" in bundle.missing_modules("question")
+    assert "c_tasks" not in bundle.missing_modules("question")
+
+
 def test_empty_modules_are_skipped_in_assembly() -> None:
     bundle = PromptBundle(
         version=1, content_hash="x", modules={"a_role": "AAA", "b_subject": "   "}
     )
     assert "b_subject" not in bundle.assemble()
+
+
+def test_each_task_assembles_only_its_own_modules() -> None:
+    """⭐ 一个 bundle 服务三个任务能不能成立，全看这一条。
+
+    模块名带任务前缀就是为了这个：任务 B 的 system 里混进 `c_tasks`
+    （那是任务 A 的任务说明），模型会照着两套互相打架的说明干活。
+    三块共用的 A / B / G 则必须都在。
+    """
+    bundle = _bundle(1, a_role="AAA")
+
+    question = bundle.assemble("question")
+    assert "<question_tasks>" in question
+    assert "<c_tasks>" not in question
+    assert "<event_tasks>" not in question
+    assert "<d_rubric>" not in question
+    assert "AAA" in question  # 共用的还在
+    assert "<g_guardrails>" in question
+
+    event = bundle.assemble("event")
+    assert "<event_tasks>" in event
+    assert "<question_tasks>" not in event
+    assert "AAA" in event
+
+    content = bundle.assemble("content")
+    assert "<c_tasks>" in content
+    assert "<question_tasks>" not in content
+    assert "<event_tasks>" not in content
+
+
+def test_the_default_task_is_the_content_one() -> None:
+    """不传任务名时拼的是内容任务——绝大多数调用都是它。"""
+    bundle = _bundle(1)
+
+    assert bundle.assemble() == bundle.assemble("content")
+
+
+def test_an_unknown_task_name_is_refused() -> None:
+    """⚠️ 不静默退回全部：那样会把三套提示词混着发给模型，而这事没人看得出来。"""
+    with pytest.raises(ValueError) as excinfo:
+        _bundle(1).assemble("events")  # 差一个字母
+
+    assert "content" in str(excinfo.value)  # 报错里列清楚有哪些任务
 
 
 # ── hash ────────────────────────────────────────────────────────────
@@ -121,7 +184,7 @@ def test_falls_back_to_example_templates(tmp_path: Path) -> None:
 
     assert bundle.version == 0
     assert "降级" in (bundle.note or "")
-    assert bundle.missing_modules() == []  # 七个模板齐了
+    assert bundle.missing_modules() == []  # 十五个模板齐了（三个任务共用一份 bundle）
     # 模板里必须写清楚"这不是真实提示词"，否则有人会拿占位内容当真结果
     assert "模板" in bundle.modules["b_subject"]
 

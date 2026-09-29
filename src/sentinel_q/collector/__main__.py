@@ -1,6 +1,7 @@
 """采集模块的独立入口（架构文档 7.4）。
 
     python -m sentinel_q.collector search   --keyword 某公司 --mode backfill
+    python -m sentinel_q.collector question --run 20260926-153000
     python -m sentinel_q.collector content  --run 20260926-153000
     python -m sentinel_q.collector comments --url https://www.zhihu.com/question/1/answer/2
     python -m sentinel_q.collector answers  --question 19581646 --mode backfill
@@ -20,17 +21,17 @@
 
 ## 为什么拆成子命令而不是 `--mode backfill` 一个开关
 
-文档 7.4 原本写的是一个 `--mode` 开关，但四个能力的**输入根本不是同一种东西**：
-能力一要关键词，能力二要 URL 清单，能力四要问题 ID。"一个开关跑全流程"
-实际会变成"每次都把四件事都跑一遍"，而它们各自要跑十几分钟、各自会被限流、
-各自值得单独看结果。分成子命令之后，**一次只做一件事、只等一件事**，
-出问题也只需要重跑那一件。
+文档 7.4 原本写的是一个 `--mode` 开关，但几个能力的**输入根本不是同一种东西**：
+能力一要关键词，能力二要 URL 清单，能力四要问题 ID，能力五要问题页 URL。
+"一个开关跑全流程"实际会变成"每次都把几件事都跑一遍"，而它们各自要跑十几分钟、
+各自会被限流、各自值得单独看结果。分成子命令之后，
+**一次只做一件事、只等一件事**，出问题也只需要重跑那一件。
 
 ## 目录与去重
 
 `runtime/ops/<run_id>/` 是本地运维账本（断点 + URL 清单 + 限流采样），
 **不入库也不入 git**（文档 3.8 / 7.8）。`search` 生产 URL 清单，
-`content` / `comments` / `answers` 消费它。
+`question` / `content` / `comments` / `answers` 消费它。
 
 去重仍然**只认"已经确定采过"的东西**（决策 51 的"文件 ∪ 库"）：
 独立跑时是本次任务的 `contents.jsonl` 里已有的 URL，
@@ -57,6 +58,7 @@ from sentinel_q.collector import (
     ops,
     parse,
     probe,
+    question,
     search,
     selectors,
 )
@@ -591,6 +593,141 @@ def cmd_comments(args: argparse.Namespace) -> int:
     return _verdict("评论", reports, lambda r: r.ok)
 
 
+class _QuestionsDoc:
+    """把采到的问题详情逐条追加进 `<run>/questions.jsonl`（能力五）。
+
+    ## 断点是 `zhihu_qid`，不是 URL
+
+    `_ContentsDoc` 挡的是 `(content_type, zhihu_id)`、并把已有的 URL 攒成
+    `urls` 喂给 `_dedup`；这份文档只装问题，所以键就是问题 ID 一个。
+    用 URL 当键也能跑，但同一问题的 URL 变体（带 query、m./www. 之别）
+    会让"采过没有"这个判断失准，而这里本来就有天然主键可用。
+
+    ⚠️ 和 `_ContentsDoc` 一样：**只挡"重复写"，不挡"重复采"**。
+    重跑照样会把页面重开一遍（浪费几秒到几十秒，但结果正确）——
+    这份文档的职责是产物，不是"要不要爬"的决策。
+    """
+
+    def __init__(self, store: ops.OpsStore) -> None:
+        self.store = store
+        self.path = store.body_path("questions")
+        self.written = 0
+        rows = list(store.iter_contents(name="questions"))
+        self.qids: set[str] = {qid for row in rows if (qid := row.get("zhihu_qid"))}
+        if self.qids:
+            log.info(
+                "这份产物里已经有 %d 个问题了（%s），重复的不会再写一遍",
+                len(self.qids),
+                self.path,
+            )
+
+    def add(self, detail: question.QuestionDetail, *, keyword: str | None = None) -> None:
+        if detail.zhihu_qid in self.qids:
+            return
+        self.qids.add(detail.zhihu_qid)
+        self.store.append_contents(
+            [question.to_row(replace(detail, keyword=keyword))], name="questions"
+        )
+        self.written += 1
+
+
+def _question_targets(entries: Iterable[ops.UrlEntry]) -> list[ops.UrlEntry]:
+    """从 URL 清单里挑出**问题页**，其余逐条报警。
+
+    清单里混着回答、文章是正常的（能力一搜出来的是内容页，不只有问题）。
+    但"整批都不是问题页"就是另一回事了，所以被挡掉的条数一定要报出来，
+    **不能静默跳过**——静默跳过的结果是"跑了、报告说 0 条、看起来像没问题"。
+
+    ⚠️ URL 在这里就换成**规范化**形式，和 `_entries_from` 同一条口径：
+    后面 `extract_question` 还要再规范化一次，两次结果必须一样，
+    否则"采过的 qid"和"要采的 qid"会对不上。
+    """
+    kept: list[ops.UrlEntry] = []
+    refused: list[str] = []
+    for entry in entries:
+        normalized = normalize(entry.url)
+        if normalized is None or normalized.content_type != "question":
+            refused.append(entry.url)
+            continue
+        kept.append(replace(entry, url=normalized.url))
+    if refused:
+        log.warning(
+            "清单里有 %d 条不是问题页（共 %d 条），跳过。前几条：%s",
+            len(refused),
+            len(refused) + len(kept),
+            ", ".join(refused[:3]),
+        )
+    return kept
+
+
+def cmd_question(args: argparse.Namespace) -> int:
+    """能力五：按问题页 URL 取描述 + 关注者/被浏览/回答数，落 `questions.jsonl`。
+
+    ## 不加 `--mode`
+
+    这一趟没有"全量/更新"两种口径，也没有游标语义——只有"这个问题采过没有"。
+    给它加一个 `--mode` 会让人以为改它有效果（同 `cmd_content`）。
+
+    ## 这里不碰库（决策 52）
+
+    采到的东西只落 `questions.jsonl`，进 `dim_question` 是主程序的事
+    （决策 53 第②步）。所以这里没有"入库成功没有"这种状态——
+    **有行就是采到了，没行就是没采到**。
+    """
+    _require_calibrated()
+
+    # ⚠️ 先校验命令行，再碰环境（浏览器）。理由同 `cmd_content`。
+    targets = _question_targets(_targets(args))
+    if not targets:
+        raise SystemExit(
+            "❌ 没给问题页 URL。用 --url https://www.zhihu.com/question/<ID>，"
+            "或者 --run <任务 ID> 从清单里挑。"
+        )
+
+    store = _open_run(args, "backfill")
+    doc = _QuestionsDoc(store)
+
+    by_url = {entry.url: entry for entry in targets}
+    # 断点按 qid 判（见 `_QuestionsDoc`）：URL 在这里已经规范化过了，
+    # 所以这一次 `normalize` 取出的 qid 和写进文档的那个一定是同一个。
+    todo = [
+        url
+        for url in by_url
+        if (normalized := normalize(url)) and normalized.zhihu_id not in doc.qids
+    ]
+    if args.limit:
+        todo = todo[: args.limit]
+    if not todo:
+        log.info("清单里 %d 个问题都已经采过了，没有要采的", len(by_url))
+        return 0
+
+    store.set_status("running")
+    reports: list[question.QuestionReport] = []
+    try:
+        with BrowserSession(_session_config(args)) as session:
+            session.on_status = store.set_status
+            session.ensure_logged_in()
+
+            for url in todo:
+                report = question.extract_question(session, url)
+                reports.append(report)
+                # ⚠️ 失败**不留行**：留一行半截的比没有更难核对，而且
+                #    `dim_question` 上的描述/热度指标是"抢占那一刻冻结"的
+                #    （迁移 0005），第一份写进去什么就永久是什么。
+                if report.detail is not None:
+                    doc.add(report.detail, keyword=by_url[url].keyword)
+                session.pace()
+    except BaseException:
+        # 崩了也要把状态写对，理由同 `cmd_search`。
+        store.set_status("failed")
+        raise
+
+    store.set_status("done")
+    log.info("问题详情落盘：%s（共 %d 行）", doc.path, doc.written)
+    log.info(question.summarize(reports))
+    return _verdict("问题详情", reports, lambda r: r.ok)
+
+
 def _crawl_question(
     session: BrowserSession,
     question_id: str,
@@ -822,11 +959,11 @@ def _verdict(what: str, reports: Sequence, ok: Callable[[object], bool]) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sentinel_q.collector",
-        description="采集模块：知乎内容采集（四个能力各自一个子命令）",
+        description="采集模块：知乎内容采集（每个能力各自一个子命令）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "典型顺序：\n"
-            "  search  →  content  →  comments\n"
+            "  search  →  question  →  content  →  comments\n"
             "  问题关键词命中的，再走 answers --question <id>\n"
             "\n"
             "跑之前先看一眼状态：python -m sentinel_q.collector status\n"
@@ -898,6 +1035,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_search.add_argument("--run", default=None, help="接着这个任务跑（默认新建）")
     p_search.set_defaults(func=cmd_search)
+
+    # ⚠️ 注册顺序 = `--help` 里的顺序 = epilog 里那条流水线的顺序
+    #    （search → question → content → comments）。三者不一致的话，
+    #    照着 `--help` 读的人会以为别处的顺序是错的。
+    p_question = sub.add_parser(
+        "question",
+        help="能力五：按问题页 URL 取描述 + 关注者/被浏览/回答数并落盘",
+        description=(
+            "打开问题页，从页面自带的 js-initialData 里取标题、描述、"
+            "关注者、被浏览、回答数和提问时间，写进这个任务的 questions.jsonl。"
+            "⚠️ **不点「显示全部」**：描述全文本来就在页面数据里（见 question.py 开头）。"
+            "⚠️ 这里**不入库**（决策 52）——采到的东西由主程序写进 dim_question。"
+            "已经采过的（本任务的 questions.jsonl 里有的）会被挡掉。"
+        ),
+    )
+    add_browser_options(p_question)
+    p_question.add_argument(
+        "--url",
+        action="append",
+        default=None,
+        help="问题页 URL（https://www.zhihu.com/question/<ID>），可给多个",
+    )
+    p_question.add_argument("--run", default=None, help="从这个任务的 urls.jsonl 读清单")
+    p_question.add_argument(
+        "--limit", type=int, default=None, help="最多采几个问题（先试几个）"
+    )
+    p_question.set_defaults(func=cmd_question)
 
     p_content = sub.add_parser(
         "content",

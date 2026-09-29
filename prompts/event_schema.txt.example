@@ -1,0 +1,9 @@
+只输出以下 JSON 格式，不要输出任何额外说明文字：
+{
+  "is_relevant": true/false,
+  "stance": "正向/反向/中立",
+  "confidence": 0.0-1.0
+}
+
+⚠️ `is_relevant` 为 false 时，`stance` 仍然必须给一个值（填"中立"即可）——
+字段不能缺，但那条判断不会被采纳。

@@ -33,6 +33,17 @@
 
 中间那一步还没接线：不变量是"AI 判完才入库"（决策 51），
 所以 `ingest` 迟早要顺手把 `fact_analysis` 一起写进去——那也是同一批。
+
+## ⚠️ 因此 `ingest` 现在**不要对真库跑**
+
+它读的只有 `contents.jsonl`，而"把 AI 判定写回**同一行**"那层文件逻辑还不存在
+（决策 51 第①条后果），所以它落下的每一行都是**有内容、没分析**的——
+正是那条不变量禁止的状态，而报告上只会写着"入库 N 条"，一切正常。
+
+要写就是整批一起写，那件事已经做出来了：`storage.ingest.insert_judged`
+收"一批记录 + 一批判定 +【本轮更新问题列表】"，把 `fact_content` 和
+`fact_analysis` 放在同一批里落。等 `analyst run` 把判定写回 `contents.jsonl`
+同一行之后，这里改成调它——**在那之前，这条路只用来跑 `--dry-run`**。
 """
 
 from __future__ import annotations
@@ -133,6 +144,14 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     if not (run_dir / "task.json").exists():
         raise SystemExit(
             f"❌ 找不到任务 {run_dir}。用 `python -m sentinel_q.collector status` 看看有哪些。"
+        )
+
+    if not args.dry_run:
+        # ⚠️ 这条警告是这个子命令现在最该说的一句话：它落下的行**没有 fact_analysis**
+        #    （决策 51 禁止的状态），而且报告上看不出来。接上 `insert_judged` 之后删掉。
+        log.warning(
+            "⚠️ `ingest` 只写 fact_content，不写 fact_analysis——这一批会是"
+            "「有内容、没分析」的状态（决策 51）。现在只该拿 --dry-run 试。"
         )
 
     repo: Repo = FakeRepo() if args.dry_run else _repo()

@@ -18,6 +18,11 @@ dependencies = [
 [project.optional-dependencies]
 # 走 psycopg 直连 Postgres，不是 supabase-py / PostgREST——理由见 sentinel_q/storage/supabase.py 开头
 db = ["psycopg[binary]>=3.1"]
+# AI 模块唯一的网络依赖。**在 analyst/client.py 里延迟 import**——没装它时
+# 拼 prompt、解析答复、跑离线测试全都照常，只有真的去调模型才报错。
+# 挑 httpx 而不是 openai SDK：DeepSeek 走 OpenAI 兼容协议，一个 HTTP 客户端就够，
+# 而且以后换别家（或换回 Anthropic SDK）时动的只有 client.py 一个文件。
+ai = ["httpx>=0.27"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4"]
 
 [tool.hatch.build.targets.wheel]

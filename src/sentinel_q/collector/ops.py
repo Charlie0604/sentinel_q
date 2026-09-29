@@ -14,7 +14,8 @@
         ├── urls.jsonl              # 能力一产出的 URL 清单（第 1 步）
         ├── update_list.jsonl       # 【更新列表】= urls − 初始列表，被逐段消费
         ├── answers.jsonl           # 能力四正文文件（第 3 步）
-        └── contents.jsonl          # 能力二正文文件（第 5 步）
+        ├── contents.jsonl          # 能力二正文文件（第 5 步）
+        └── questions.jsonl         # 能力五问题详情（第 2 步）
 
 ⚠️ **硬约束（7.8 推论二）：放这里的东西必须可以重建**——要么能从数据库
 推出来，要么重爬一次就能拿到。逐项对照见 3.8 的表格。唯一的例外是
@@ -237,25 +238,45 @@ class OpsStore:
 
     # ── 正文产物 ────────────────────────────────────────────────────
     #
-    # 两份正文文件，格式一样、互相独立（架构文档 3.3 / 7.8，决策 53）：
+    # 几份产物文件，格式一样、互相独立（架构文档 3.3 / 7.8，决策 53）：
     #
+    #   questions.jsonl  ← 能力五：问题详情（第 2 步）——**不是正文**，
+    #                      装的是标题/描述/热度指标，进的是 dim_question
     #   answers.jsonl    ← 能力四：问题下的全部回答（第 3 步）
     #   contents.jsonl   ← 能力二：清单里剩下的正文（第 5 步），
     #                      也是"手动收评论"那条路的落点
     #
-    # 名字就是这里的 key，文件落在 <run>/<name>.jsonl。两条能力**不共用一份**：
+    # 名字就是这里的 key，文件落在 <run>/<name>.jsonl。几条能力**不共用一份**：
     # 它们共享的是【更新列表】（谁先跑谁划掉自己采到的），不是文件。
 
     BODY_FILES = ("answers", "contents")
+    """**正文文件**：行装得成 `ContentRecord`、能进 `fact_content` 的那两份。
+
+    ⚠️ `questions.jsonl` **不在这里，而且不能加进来**。它装的是问题详情
+    （进 `dim_question`），行里没有 `zhihu_id`，`extract.from_document` 会一条条
+    拒掉并逐行打"装不成记录"的警告。而 `scripts/` 下有三个夹具脚本正是
+    `for name in OpsStore.BODY_FILES:` 地遍历它去入库的
+    （`ingest_fixture` / `replay_fixture` / `judge_fixture`）——
+    加一项进去，它们报出来的"装不成记录"会凭空多出问题的行数，
+    而那个数字是多份 README 里写明的验收基准。
+    """
+
+    PRODUCT_FILES = (*BODY_FILES, "questions")
+    """这个任务**全部产物文件**——`body_path()` 认的就是这几个名字。
+
+    与 `BODY_FILES` 分开是刻意的：那个管"哪些行是 fact_content 的候选"，
+    这个管"有哪些文件"。合成一个的话，"新增一份产物"和"新增一种正文"
+    就变成同一个动作了（见 `BODY_FILES` 那段）。
+    """
 
     def body_path(self, name: str = "contents") -> Path:
-        """某一份正文文件的路径。
+        """某一份产物文件的路径。
 
         ⚠️ 不认识的名字直接报错，**不能**当成合法路径拼出去：那样一个拼错的
-        `"answer"`（少个 s）会悄悄造出第三份文件，而两份产物看起来都"跑通了"。
+        `"answer"`（少个 s）会悄悄造出第四份文件，而几份产物看起来都"跑通了"。
         """
-        if name not in self.BODY_FILES:
-            raise ValueError(f"未知的正文文件 {name!r}，只能是 {self.BODY_FILES}")
+        if name not in self.PRODUCT_FILES:
+            raise ValueError(f"未知的产物文件 {name!r}，只能是 {self.PRODUCT_FILES}")
         return self.run_dir / f"{name}.jsonl"
 
     @property
@@ -274,9 +295,13 @@ class OpsStore:
         理由是那个 set 要跨 URL 累积，放在这一层反而要每次重读整份文件）。
 
         ⚠️ 逐行 `json.dumps`，所以传进来的 `dict` 里不能有**不可序列化**的值
-        （`datetime` 之类）——`extract.to_document` 已经把它们都转成字符串了。
+        （`datetime` 之类）——`extract.to_document` / `question.to_row`
+        已经把它们都转成字符串了。
 
-        `name` 选哪一份：`"answers"` 是能力四的，`"contents"` 是能力二的。
+        `name` 选哪一份：`"answers"` 是能力四的，`"contents"` 是能力二的，
+        `"questions"` 是能力五的（它装的不是正文，见 `BODY_FILES`）。
+        ⚠️ **只有前两份是"正文"**——遍历它们去入库的调用方要用 `BODY_FILES`，
+        不是 `PRODUCT_FILES`。
         """
         count = 0
         with self.body_path(name).open("a", encoding="utf-8") as fh:
